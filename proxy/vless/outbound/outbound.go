@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/app/reverse"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
@@ -54,9 +55,10 @@ type Handler struct {
 	encryption    *encryption.ClientInstance
 	reverse       *Reverse
 
-	testpre   uint32
-	initConns sync.Once
-	conns     chan stat.Connection
+	testpre     uint32
+	initConns   sync.Once
+	conns       chan stat.Connection
+	PreConnStop chan struct{}
 }
 
 // New creates a new VLess outbound handler.
@@ -117,6 +119,17 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 
 // Close implements common.Closable.Close().
 func (h *Handler) Close() error {
+	if h.PreConnStop != nil {
+		close(h.PreConnStop)
+		for cleared := false; !cleared; {
+			select {
+			case conn := <-h.conns:
+				conn.Close()
+			default:
+				cleared = true
+			}
+		}
+	}
 	if h.reverse != nil {
 		return h.reverse.Close()
 	}
@@ -451,8 +464,23 @@ func (r *Reverse) Close() error {
 
 func (h *Handler) preConnWorker(dialer internet.Dialer, dest net.Destination) {
 	for {
-		if conn, err := dialer.Dial(context.Background(), dest); err == nil {
-			h.conns <- conn
+		select {
+		case <-h.PreConnStop:
+			return
+		default:
+		}
+		conn, err := dialer.Dial(context.Background(), dest)
+		if err != nil {
+			sleep := time.Duration(dice.Roll(5000) * int(time.Millisecond))
+			time.Sleep(sleep)
+			continue
+		}
+		select {
+		case h.conns <- conn:
+			continue
+		case <-h.PreConnStop:
+			conn.Close()
+			return
 		}
 	}
 }

@@ -16,7 +16,6 @@ import (
 	"github.com/xtls/xray-core/app/reverse"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
@@ -57,8 +56,9 @@ type Handler struct {
 
 	testpre     uint32
 	initConns   sync.Once
-	conns       chan stat.Connection
-	PreConnStop chan struct{}
+	preConns    chan stat.Connection
+	preConnWait chan struct{}
+	preConnStop chan struct{}
 }
 
 // New creates a new VLess outbound handler.
@@ -119,15 +119,11 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 
 // Close implements common.Closable.Close().
 func (h *Handler) Close() error {
-	if h.PreConnStop != nil {
-		close(h.PreConnStop)
-		for cleared := false; !cleared; {
-			select {
-			case conn := <-h.conns:
-				conn.Close()
-			default:
-				cleared = true
-			}
+	if h.preConnStop != nil {
+		close(h.preConnStop)
+		for range h.testpre {
+			conn := <-h.preConns
+			common.CloseIfExists(conn)
 		}
 	}
 	if h.reverse != nil {
@@ -150,11 +146,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	if h.testpre > 0 && h.reverse == nil {
 		h.initConns.Do(func() {
-			h.conns = make(chan stat.Connection, h.testpre)
+			h.preConns = make(chan stat.Connection, h.testpre)
+			h.preConnStop = make(chan struct{})
 			go h.preConnWorker(dialer, rec.Destination)
 		})
 		select {
-		case conn = <-h.conns:
+		case h.preConnWait <- struct{}{}:
+		default:
+		}
+		select {
+		case conn = <-h.preConns:
 		default:
 		}
 	}
@@ -463,23 +464,40 @@ func (r *Reverse) Close() error {
 }
 
 func (h *Handler) preConnWorker(dialer internet.Dialer, dest net.Destination) {
-	for {
-		select {
-		case <-h.PreConnStop:
-			return
-		default:
-		}
+	conns := make(chan stat.Connection)
+	dial := func() {
 		conn, err := dialer.Dial(context.Background(), dest)
 		if err != nil {
-			sleep := time.Duration(dice.Roll(5000) * int(time.Millisecond))
-			time.Sleep(sleep)
-			continue
+			errors.LogError(context.Background(), "failed to dial VLESS pre connection: ", err)
+			common.CloseIfExists(conn)
 		}
+		conns <- conn
+	}
+	for range h.testpre {
+		go dial()
+		<-h.preConnWait
+	}
+	for {
 		select {
-		case h.conns <- conn:
-			continue
-		case <-h.PreConnStop:
-			conn.Close()
+		case conn := <-conns:
+			if conn != nil {
+				select {
+				case h.preConns <- conn:
+				case <-h.preConnStop:
+					common.CloseIfExists(conn)
+					return
+				}
+				go dial()
+			} else {
+				// sleep until next client try
+				select {
+				case <-h.preConnWait:
+					go dial()
+				case <-h.preConnStop:
+					return
+				}
+			}
+		case <-h.preConnStop:
 			return
 		}
 	}
